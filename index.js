@@ -22,43 +22,27 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS verification_config (guild_id TEXT PRIMARY KEY, auto_role TEXT, verified_role TEXT, channel TEXT, image_url TEXT, setup_by TEXT, setup_at TEXT)`);
     db.run(`CREATE TABLE IF NOT EXISTS user_stats (user_id TEXT PRIMARY KEY, messages INTEGER DEFAULT 0, voice_minutes INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1)`);
     db.run(`CREATE TABLE IF NOT EXISTS free_games_sent (id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT UNIQUE, sent_at TEXT)`);
+    db.run(`CREATE TABLE IF NOT EXISTS auto_role_users (user_id TEXT PRIMARY KEY, guild_id TEXT, had_role INTEGER DEFAULT 1, last_seen TEXT)`);
+    db.run(`CREATE TABLE IF NOT EXISTS giveaways (id TEXT PRIMARY KEY, message_id TEXT, channel_id TEXT, prize TEXT, winners INTEGER, end_time INTEGER, hosted_by TEXT, ended INTEGER DEFAULT 0)`);
+    db.run(`CREATE TABLE IF NOT EXISTS auto_voice (guild_id TEXT, user_id TEXT, channel_id TEXT, PRIMARY KEY (guild_id, user_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS auto_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT, trigger_word TEXT, response TEXT, created_by TEXT, created_at TEXT)`);
     
-    // Store users who had the auto role (for re-adding when they rejoin)
-    db.run(`CREATE TABLE IF NOT EXISTS auto_role_users (
-        user_id TEXT PRIMARY KEY,
-        guild_id TEXT,
-        had_role INTEGER DEFAULT 1,
-        last_seen TEXT
-    )`);
-    
-    // Giveaway table
-    db.run(`CREATE TABLE IF NOT EXISTS giveaways (
-        id TEXT PRIMARY KEY,
-        message_id TEXT,
-        channel_id TEXT,
-        prize TEXT,
-        winners INTEGER,
-        end_time INTEGER,
-        hosted_by TEXT,
-        ended INTEGER DEFAULT 0
-    )`);
-    
-    // Auto Voice System table
-    db.run(`CREATE TABLE IF NOT EXISTS auto_voice (
+    // ========== NEW INVITE TABLES ==========
+    db.run(`CREATE TABLE IF NOT EXISTS invites (
         guild_id TEXT,
         user_id TEXT,
-        channel_id TEXT,
+        invite_code TEXT,
+        uses INTEGER DEFAULT 0,
         PRIMARY KEY (guild_id, user_id)
     )`);
     
-    // Auto Message System table (for any trigger word)
-    db.run(`CREATE TABLE IF NOT EXISTS auto_messages (
+    db.run(`CREATE TABLE IF NOT EXISTS invite_uses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id TEXT,
-        trigger_word TEXT,
-        response TEXT,
-        created_by TEXT,
-        created_at TEXT
+        inviter_id TEXT,
+        invitee_id TEXT,
+        invite_code TEXT,
+        joined_at TEXT
     )`);
     
     console.log('✅ Database ready');
@@ -67,7 +51,6 @@ db.serialize(() => {
 // Config
 const { BOT_TOKEN, LOG_CHANNEL_ID, MOD_ROLE_ID, AUTO_ROLE_ID, VOICE_CHANNEL_ID, WELCOME_CHANNEL_ID } = process.env;
 
-// Welcome channel ID and Auto Role ID (hardcoded as requested)
 const WELCOME_IMAGE_URL = "https://media.discordapp.net/attachments/1504944590162231326/1509687379198345378/BBCD65E5-E8A2-47BB-80A0-0A208431F3A6.png?ex=6a1abe2f&is=6a196caf&hm=b8d17e03f0614a9b9b92f10337f0cf995542b06646d7771e3393a5e2e2bb4d25&=&format=webp&quality=lossless&width=1705&height=682";
 const AUTO_ROLE_ID_FIXED = "1508206937991413800";
 const WELCOME_CHANNEL_ID_FIXED = "1509920672866897962";
@@ -97,7 +80,7 @@ const linkWarnCooldown = new Map();
 
 // Auto Voice System
 const autoVoiceCache = new Map();
-const userPersonalChannels = new Map(); // Track which personal channel belongs to which user
+const userPersonalChannels = new Map();
 
 // Anti-spam tracking
 const messageCooldown = new Map();
@@ -107,6 +90,9 @@ const autoRoleUsersCache = new Set();
 
 // Auto Message System cache
 const autoMessagesCache = new Map();
+
+// ========== INVITE CACHE ==========
+const inviteCache = new Map(); // guildId -> Map(inviteCode -> uses)
 
 // Free games list
 const FREE_STEAM_GAMES = [
@@ -277,6 +263,49 @@ function addWarning(uid, gid, reason, mod) {
 function getWarnCount(uid, gid) {
     return new Promise((r) => {
         db.get(`SELECT COUNT(*) as c FROM warnings WHERE user_id = ? AND guild_id = ?`, [uid, gid], (err, row) => r(row ? row.c : 0));
+    });
+}
+
+// ========== INVITE DATABASE FUNCTIONS ==========
+
+function getInviteCount(guildId, userId) {
+    return new Promise((resolve) => {
+        db.get(`SELECT uses FROM invites WHERE guild_id = ? AND user_id = ?`, [guildId, userId], (err, row) => {
+            resolve(row ? row.uses : 0);
+        });
+    });
+}
+
+function addInviteUse(guildId, inviterId, inviteeId, inviteCode) {
+    return new Promise((resolve) => {
+        db.run(`INSERT INTO invite_uses (guild_id, inviter_id, invitee_id, invite_code, joined_at) VALUES (?, ?, ?, ?, ?)`,
+            [guildId, inviterId, inviteeId, inviteCode, new Date().toISOString()], (err) => {
+                if (err) console.error('Error adding invite use:', err);
+                // Increase invite count for inviter
+                db.run(`INSERT INTO invites (guild_id, user_id, invite_code, uses) VALUES (?, ?, ?, 1)
+                        ON CONFLICT(guild_id, user_id) DO UPDATE SET uses = uses + 1, invite_code = excluded.invite_code`,
+                    [guildId, inviterId, inviteCode], (err2) => {
+                        if (err2) console.error('Error updating invite count:', err2);
+                        resolve();
+                    });
+            });
+    });
+}
+
+function getInviteUses(guildId, inviterId) {
+    return new Promise((resolve) => {
+        db.all(`SELECT invitee_id, invite_code, joined_at FROM invite_uses WHERE guild_id = ? AND inviter_id = ? ORDER BY joined_at DESC LIMIT 10`,
+            [guildId, inviterId], (err, rows) => {
+                resolve(rows || []);
+            });
+    });
+}
+
+function getAllInviteCodes(guildId) {
+    return new Promise((resolve) => {
+        db.all(`SELECT user_id, invite_code, uses FROM invites WHERE guild_id = ?`, [guildId], (err, rows) => {
+            resolve(rows || []);
+        });
     });
 }
 
@@ -733,20 +762,15 @@ async function handleAutoMessage(message) {
     if (message.author.bot) return;
     if (message.content.startsWith('-')) return;
     
-    // Check for any trigger word in the message content
     const content = message.content.toLowerCase();
-    
-    // Get all auto messages for this guild
     const autoMessages = await getAllAutoMessages(message.guild.id);
     
     for (const autoMsg of autoMessages) {
         const triggerWord = autoMsg.trigger_word.toLowerCase();
-        // Check if the message contains the trigger word
         if (content.includes(triggerWord)) {
-            // Send the response as a reply
             await message.reply(autoMsg.response);
             console.log(`📨 Auto message triggered for "${triggerWord}" in ${message.guild.name}`);
-            break; // Only trigger the first match
+            break;
         }
     }
 }
@@ -767,12 +791,10 @@ async function sendMassDM(member, message, author) {
             await member.send(message);
             successCount++;
             
-            // Update status every 10 members
             if ((successCount + failCount) % 10 === 0) {
                 await statusMsg.edit(`🔄 **Progress:** ${successCount + failCount}/${members.size} | ✅ Success: ${successCount} | ❌ Failed: ${failCount}`);
             }
             
-            // Small delay to avoid rate limiting
             await new Promise(r => setTimeout(r, 500));
         } catch (error) {
             failCount++;
@@ -868,15 +890,12 @@ async function sendWelcomeWithImage(member) {
     const autoRole = member.guild.roles.cache.get(AUTO_ROLE_ID_FIXED);
     if (autoRole) {
         try {
-            // Check if user had the role before (left and rejoined)
             const hadRoleBefore = await hadAutoRoleBefore(member.id, member.guild.id);
             
             if (hadRoleBefore) {
-                // User is returning, re-add the role
                 await member.roles.add(autoRole);
                 console.log(`✅ Re-added auto role to returning member: ${member.user.tag}`);
                 
-                // Send returning welcome message
                 const returnEmbed = new EmbedBuilder()
                     .setColor(0x5865F2)
                     .setTitle(`🎉 WELCOME BACK TO ${member.guild.name.toUpperCase()}! 🎉`)
@@ -893,12 +912,10 @@ async function sendWelcomeWithImage(member) {
                 
                 await welcomeChannel.send({ content: `${member.toString()}`, embeds: [returnEmbed] });
             } else {
-                // New member, add role and save to database
                 await member.roles.add(autoRole);
                 await saveAutoRoleUser(member.id, member.guild.id);
                 console.log(`✅ Added auto role to new member: ${member.user.tag}`);
                 
-                // Send new member welcome message
                 const welcomeEmbed = new EmbedBuilder()
                     .setColor(0x5865F2)
                     .setTitle(`🎉 WELCOME TO ${member.guild.name.toUpperCase()}! 🎉`)
@@ -1092,6 +1109,76 @@ async function cleanupExpiredGiveaways() {
         }
         console.log(`🧹 Cleaned up ${rows.length} expired giveaways`);
     });
+}
+
+// ========== INVITE TRACKING FUNCTIONS ==========
+
+async function cacheInvites(guild) {
+    try {
+        const invites = await guild.invites.fetch();
+        const guildCache = new Map();
+        invites.forEach(inv => {
+            guildCache.set(inv.code, inv.uses || 0);
+        });
+        inviteCache.set(guild.id, guildCache);
+        console.log(`📌 Cached ${guildCache.size} invites for ${guild.name}`);
+    } catch (error) {
+        console.error(`❌ Failed to fetch invites for ${guild.name}:`, error.message);
+    }
+}
+
+async function processNewMember(member) {
+    const guild = member.guild;
+    if (!inviteCache.has(guild.id)) {
+        await cacheInvites(guild);
+        return;
+    }
+
+    try {
+        const currentInvites = await guild.invites.fetch();
+        const oldCache = inviteCache.get(guild.id);
+        let usedInvite = null;
+        let usedCode = null;
+
+        // Find which invite got a new use
+        for (const [code, invite] of currentInvites) {
+            const oldUses = oldCache.get(code) || 0;
+            const newUses = invite.uses || 0;
+            if (newUses > oldUses) {
+                usedInvite = invite;
+                usedCode = code;
+                break;
+            }
+        }
+
+        // If no invite found (maybe user joined via vanity URL or other), ignore
+        if (!usedInvite) {
+            console.log(`⚠️ No invite found for ${member.user.tag}, joining via unknown method.`);
+            // Update cache to new values anyway
+            const newCache = new Map();
+            currentInvites.forEach(inv => newCache.set(inv.code, inv.uses || 0));
+            inviteCache.set(guild.id, newCache);
+            return;
+        }
+
+        const inviterId = usedInvite.inviter?.id;
+        if (!inviterId) {
+            console.log(`⚠️ Invite code ${usedCode} has no inviter.`);
+            return;
+        }
+
+        // Save the invite use
+        await addInviteUse(guild.id, inviterId, member.id, usedCode);
+
+        // Update cache
+        const newCache = new Map();
+        currentInvites.forEach(inv => newCache.set(inv.code, inv.uses || 0));
+        inviteCache.set(guild.id, newCache);
+
+        console.log(`✅ ${member.user.tag} joined via ${usedCode} (inviter: ${usedInvite.inviter?.tag})`);
+    } catch (error) {
+        console.error(`❌ Error processing invite for ${member.user.tag}:`, error.message);
+    }
 }
 
 // ========== VOICE CONTROL HANDLERS ==========
@@ -1308,9 +1395,41 @@ client.on('messageCreate', async (message) => {
         return message.reply({ embeds: [embed] });
     }
     
+    // ========== INVITE COMMANDS ==========
+
+    if (cmd === 'me' && args[0] === 'invite') {
+        let targetId = args[1] || message.author.id;
+        let targetUser;
+        try {
+            targetUser = await client.users.fetch(targetId);
+        } catch (e) {
+            return message.reply('❌ User not found! Please provide a valid user ID.');
+        }
+
+        const inviteCount = await getInviteCount(guild.id, targetId);
+        const inviteUses = await getInviteUses(guild.id, targetId);
+
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle(`📨 Invite Statistics for ${targetUser.tag}`)
+            .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+            .addFields(
+                { name: '📊 Total Invites', value: `${inviteCount}`, inline: true },
+                { name: '👥 Invited Users (Last 10)', value: inviteUses.length > 0 
+                    ? inviteUses.map((u, i) => {
+                        const user = client.users.cache.get(u.invitee_id);
+                        return `${i+1}. ${user ? user.tag : 'Unknown'} (${new Date(u.joined_at).toLocaleDateString()})`;
+                    }).join('\n')
+                    : 'No users invited yet.',
+                    inline: false }
+            )
+            .setTimestamp();
+
+        return message.reply({ embeds: [embed] });
+    }
+
     // ========== AUTO MESSAGE COMMANDS ==========
     
-    // -auto mss <trigger> <response> - Set auto response for any word
     if (cmd === 'auto' && args[0] === 'mss') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
@@ -1339,7 +1458,6 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
-    // -auto list - List all auto messages
     if (cmd === 'auto' && args[0] === 'list') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
@@ -1364,7 +1482,6 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
-    // -auto remove <trigger> - Remove auto message for a trigger word
     if (cmd === 'auto' && args[0] === 'remove') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
@@ -1479,7 +1596,6 @@ client.on('messageCreate', async (message) => {
             return message.reply('❌ Usage: `-mess <message>`\nExample: `-mess Hello everyone! This is an important announcement.`\n\nThis will send the message to ALL members via DM.');
         }
         
-        // Confirmation message
         const confirmEmbed = new EmbedBuilder()
             .setColor(0xFF69B4)
             .setTitle('📨 Mass DM Confirmation')
@@ -1676,6 +1792,7 @@ client.on('messageCreate', async (message) => {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Commands')
             .setDescription('**Prefix:** `-`')
             .addFields(
+                { name: '📨 Invite Tracker', value: '`-me invite` - Your invite stats\n`-me invite <user_id>` - Others invite stats', inline: false },
                 { name: '📨 Auto Message (Any Word)', value: '`-auto mss <word> <response>` - Set auto response for any word\n`-auto list` - List all auto messages\n`-auto remove <word>` - Remove auto message', inline: false },
                 { name: '📨 Mass DM', value: '`-mess <message>` - Send a DM to ALL members in the server', inline: false },
                 { name: '🎤 Auto Voice System', value: '`-voice add <channel_id>` - Enable auto personal VC\n`-cn <channel_id>` - Send control panel to this text channel', inline: false },
@@ -2077,6 +2194,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 client.on('guildMemberAdd', async (member) => {
     if (member.user.bot) return;
     await sendWelcomeWithImage(member);
+    await processNewMember(member); // <-- Added invite tracking
 });
 
 // ========== TRACK MEMBER REMOVAL (for auto role re-add on rejoins) ==========
@@ -2289,7 +2407,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
     
-    // Mass DM confirmation buttons
     if (interaction.isButton() && (interaction.customId === 'confirm_mess' || interaction.customId === 'cancel_mess')) {
         return;
     }
@@ -2302,6 +2419,7 @@ client.once('ready', async () => {
     console.log(`✅ ${client.user.tag} is online!`);
     console.log(`🤖 AI Chat System Ready - Natural Darija Support`);
     console.log(`📝 AI Commands: -ai <message> | -ask <question> | -iahelp`);
+    console.log(`📨 Invite Tracker: -me invite`);
     console.log(`📨 Auto Message System: -auto mss <any_word> <response>`);
     console.log(`📨 Mass DM Command: -mess <message> - Send DM to ALL members`);
     console.log(`🎉 Giveaway Command: -gv <winners> <time> <prize>`);
@@ -2322,6 +2440,12 @@ client.once('ready', async () => {
     console.log(`   • Welcome Channel: ${WELCOME_CHANNEL_ID_FIXED} - Welcome message with image`);
     console.log(`📋 Other Commands: -help for full list`);
     client.user.setActivity('-help for commands', { type: 3 });
+    
+    // Cache invites for all guilds
+    for (const guild of client.guilds.cache.values()) {
+        await cacheInvites(guild);
+    }
+    
     setTimeout(() => joinVoiceChannelProper(), 3000);
 });
 
